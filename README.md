@@ -197,3 +197,14 @@ This restores your original `agy` binary, removes shell integration, and prompts
 Contributions, bug reports, and feature suggestions are welcome! Feel free to open an issue or submit a Pull Request.
 
 Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for more information.
+
+---
+
+## 🛠️ Development & Session Reference
+
+- **Development Session ID**: `282a378d-7e20-4699-985e-bfd415a306c1`
+
+> **Tip for Future Maintenance**: You can resume this exact development session and context in Antigravity CLI anytime to debug, maintain, or add new features by running:
+> ```bash
+> agy --conversation 282a378d-7e20-4699-985e-bfd415a306c1
+> ```
