@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Account credentials / tokens (NEVER commit tokens)
+*token*.json
+antigravity-oauth-token
+accounts.json
+active.json
+.staging_login/
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+*.log

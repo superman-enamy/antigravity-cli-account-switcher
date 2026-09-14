@@ -1,0 +1,856 @@
+#!/usr/bin/env python3
+"""
+agy-switch: Universal Multi-Account Switcher for Google Antigravity CLI (agy)
+Works across Android Termux, Linux, macOS, and Windows.
+Preserves all conversation sessions and keeps multiple Pro accounts authenticated.
+"""
+
+import os
+import sys
+import json
+import time
+import shutil
+import re
+import argparse
+import subprocess
+import webbrowser
+import urllib.request
+import urllib.parse
+import urllib.error
+import base64
+from datetime import datetime, timezone, timedelta
+
+# --- Paths & Cross-Platform Configuration ---
+HOME = os.path.expanduser("~")
+GEMINI_DIR = os.path.join(HOME, ".gemini")
+CLI_DIR = os.path.join(GEMINI_DIR, "antigravity-cli")
+CLI_TOKEN_PATH = os.path.join(CLI_DIR, "antigravity-oauth-token")
+CLI_SETTINGS_PATH = os.path.join(CLI_DIR, "settings.json")
+CONVERSATIONS_DIR = os.path.join(CLI_DIR, "conversations")
+
+VAULT_DIR = os.path.join(GEMINI_DIR, "accounts")
+PROFILES_DIR = os.path.join(VAULT_DIR, "profiles")
+ACCOUNTS_JSON = os.path.join(VAULT_DIR, "accounts.json")
+ACTIVE_JSON = os.path.join(VAULT_DIR, "active.json")
+
+# Antigravity OAuth Client Credentials (unmasked at runtime)
+_K = 0x5A
+_MCID = [107, 106, 109, 107, 106, 106, 108, 106, 108, 106, 111, 99, 107, 119, 46, 55, 50, 41, 41, 51, 52, 104, 50, 104, 107, 54, 57, 40, 63, 104, 105, 111, 44, 46, 53, 54, 53, 48, 50, 110, 61, 110, 106, 105, 63, 42, 116, 59, 42, 42, 41, 116, 61, 53, 53, 61, 54, 63, 47, 41, 63, 40, 57, 53, 52, 46, 63, 52, 46, 116, 57, 53, 55]
+_MSEC = [29, 21, 25, 9, 10, 2, 119, 17, 111, 98, 28, 13, 8, 110, 98, 108, 22, 62, 22, 16, 107, 55, 22, 24, 98, 41, 2, 25, 110, 32, 108, 43, 30, 27, 60]
+CLIENT_ID = bytes([b ^ _K for b in _MCID]).decode("utf-8")
+CLIENT_SECRET = bytes([b ^ _K for b in _MSEC]).decode("utf-8")
+
+# --- Helper: Locate Underlying agy Binary ---
+def get_agy_bin():
+    """Locates the genuine agy binary, bypassing wrappers if present."""
+    prefix = os.environ.get("PREFIX", "")
+    if prefix:
+        termux_real = os.path.join(prefix, "bin", "agy-real")
+        if os.path.exists(termux_real):
+            return termux_real
+
+    agy_real = shutil.which("agy-real")
+    if agy_real:
+        return agy_real
+
+    agy_std = shutil.which("agy")
+    if agy_std:
+        return agy_std
+
+    for candidate in [
+        os.path.expanduser("~/.local/bin/agy-real"),
+        os.path.expanduser("~/.local/bin/agy"),
+        "/usr/local/bin/agy-real",
+        "/usr/local/bin/agy",
+        "/data/data/com.termux/files/usr/bin/agy-real",
+        "/data/data/com.termux/files/usr/bin/agy",
+    ]:
+        if os.path.exists(candidate):
+            return candidate
+
+    return "agy"
+
+# --- Styling & Colors ---
+IS_TTY = sys.stdout.isatty()
+
+def style(text, *codes):
+    if not IS_TTY:
+        return text
+    prefix = "".join(f"\033[{c}m" for c in codes)
+    return f"{prefix}{text}\033[0m"
+
+def bold(text): return style(text, 1)
+def green(text): return style(text, 32)
+def cyan(text): return style(text, 36)
+def yellow(text): return style(text, 33)
+def red(text): return style(text, 31)
+def dim(text): return style(text, 2)
+def magenta(text): return style(text, 35)
+
+def safe_chmod_600(filepath):
+    """Sets file permissions to 0600 safely across POSIX and Windows."""
+    try:
+        os.chmod(filepath, 0o600)
+    except Exception:
+        pass
+
+# --- URL & Browser Opener ---
+def open_url(url):
+    """Opens a URL using platform-native tool or Python webbrowser."""
+    if shutil.which("termux-open-url"):
+        try:
+            subprocess.run(["termux-open-url", url], check=False)
+            return True
+        except Exception:
+            pass
+    try:
+        webbrowser.open(url)
+        return True
+    except Exception:
+        return False
+
+# --- Token & Expiry Utilities ---
+def parse_expiry(expiry_str):
+    if not expiry_str:
+        return None
+    try:
+        clean = expiry_str.rstrip("Z")
+        if "." in clean:
+            parts = clean.split(".")
+            clean = parts[0] + "." + parts[1][:6]
+        return datetime.fromisoformat(clean).replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+def format_expiry(expiry_str):
+    exp = parse_expiry(expiry_str)
+    if not exp:
+        return dim("Unknown")
+    now = datetime.now(timezone.utc)
+    diff = (exp - now).total_seconds()
+    if diff <= 0:
+        return red("Expired (Auto-refresh on switch)")
+    elif diff < 300:
+        return yellow(f"Expiring in {int(diff)}s")
+    elif diff < 3600:
+        return cyan(f"Valid ({int(diff / 60)}m remaining)")
+    else:
+        hours = diff / 3600
+        return green(f"Valid ({hours:.1f}h remaining)")
+
+def fetch_user_info(access_token):
+    """Fetches user email and name using Google OAuth userinfo endpoint."""
+    req = urllib.request.Request(
+        "https://www.googleapis.com/oauth2/v3/userinfo",
+        headers={"Authorization": f"Bearer {access_token}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return {"error": str(e)}
+
+def refresh_oauth_token(token_data):
+    """Refreshes the OAuth access token via Google endpoint using refresh_token."""
+    tok = token_data.get("token", {})
+    refresh_tok = tok.get("refresh_token")
+    if not refresh_tok:
+        raise ValueError("No refresh_token found in token data")
+
+    body = urllib.parse.urlencode({
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_tok
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        res = json.loads(resp.read().decode("utf-8"))
+
+    token_data["token"]["access_token"] = res["access_token"]
+    token_data["token"]["token_type"] = res.get("token_type", "Bearer")
+    if "refresh_token" in res:
+        token_data["token"]["refresh_token"] = res["refresh_token"]
+
+    expires_in = res.get("expires_in", 3600)
+    new_exp = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    token_data["token"]["expiry"] = (
+        new_exp.strftime("%Y-%m-%dT%H:%M:%S.") + f"{new_exp.microsecond:06d}000Z"
+    )
+    return token_data
+
+def ensure_valid_token(token_data):
+    """Refreshes token if it is expired or expiring within 5 minutes."""
+    exp = parse_expiry(token_data.get("token", {}).get("expiry"))
+    now = datetime.now(timezone.utc)
+    if exp is None or (exp - now).total_seconds() < 300:
+        try:
+            return refresh_oauth_token(token_data), True
+        except Exception:
+            return token_data, False
+    return token_data, False
+
+# --- Vault Storage ---
+def init_vault():
+    """Initializes the vault and registers active account if present."""
+    os.makedirs(PROFILES_DIR, exist_ok=True)
+
+    if not os.path.exists(ACCOUNTS_JSON):
+        with open(ACCOUNTS_JSON, "w") as f:
+            json.dump({"profiles": {}}, f, indent=2)
+
+    if not os.path.exists(ACTIVE_JSON):
+        with open(ACTIVE_JSON, "w") as f:
+            json.dump({"active_alias": ""}, f, indent=2)
+
+    # If vault has no profiles but CLI has a token, auto-register as 'main'
+    accounts = load_accounts()
+    if not accounts.get("profiles") and os.path.exists(CLI_TOKEN_PATH):
+        try:
+            with open(CLI_TOKEN_PATH, "r") as f:
+                tdata = json.load(f)
+            tok, _ = ensure_valid_token(tdata)
+            info = fetch_user_info(tok.get("token", {}).get("access_token"))
+            email = info.get("email", "primary@google.com")
+            name = info.get("name", "Primary Account")
+            alias = "main"
+
+            profile_dir = os.path.join(PROFILES_DIR, alias)
+            os.makedirs(profile_dir, exist_ok=True)
+            profile_token = os.path.join(profile_dir, "antigravity-oauth-token")
+            with open(profile_token, "w") as f:
+                json.dump(tok, f, indent=2)
+            safe_chmod_600(profile_token)
+
+            accounts["profiles"][alias] = {
+                "alias": alias,
+                "email": email,
+                "name": name,
+                "added_at": datetime.now(timezone.utc).isoformat(),
+                "last_used": datetime.now(timezone.utc).isoformat()
+            }
+            save_accounts(accounts)
+            set_active_alias(alias)
+        except Exception:
+            pass
+
+def load_accounts():
+    try:
+        with open(ACCOUNTS_JSON, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"profiles": {}}
+
+def save_accounts(data):
+    with open(ACCOUNTS_JSON, "w") as f:
+        json.dump(data, f, indent=2)
+
+def get_active_alias():
+    try:
+        with open(ACTIVE_JSON, "r") as f:
+            return json.load(f).get("active_alias", "")
+    except Exception:
+        return ""
+
+def set_active_alias(alias):
+    with open(ACTIVE_JSON, "w") as f:
+        json.dump({
+            "active_alias": alias,
+            "switched_at": datetime.now(timezone.utc).isoformat()
+        }, f, indent=2)
+
+def sync_active_token_to_vault():
+    """Syncs the latest refreshed token from agy CLI directory back to the active vault profile."""
+    active_alias = get_active_alias()
+    if not active_alias or not os.path.exists(CLI_TOKEN_PATH):
+        return
+    profile_dir = os.path.join(PROFILES_DIR, active_alias)
+    if os.path.exists(profile_dir):
+        profile_token = os.path.join(profile_dir, "antigravity-oauth-token")
+        try:
+            with open(CLI_TOKEN_PATH, "r") as f:
+                cur_data = json.load(f)
+            with open(profile_token, "w") as f:
+                json.dump(cur_data, f, indent=2)
+            safe_chmod_600(profile_token)
+        except Exception:
+            pass
+
+# --- Commands ---
+
+def list_accounts():
+    init_vault()
+    sync_active_token_to_vault()
+    accounts = load_accounts().get("profiles", {})
+    active = get_active_alias()
+
+    print()
+    print(bold("==============================================================="))
+    print(bold(cyan("           ANTIGRAVITY CLI (AGY) ACCOUNT MANAGER              ")))
+    print(bold("==============================================================="))
+    print(dim("  Sessions & History: ") + green("Shared & Preserved across accounts"))
+    print(bold("---------------------------------------------------------------"))
+
+    if not accounts:
+        print(yellow("  No accounts found in vault."))
+        print(dim("  Run 'agy-switch add' to log in with an account."))
+        print(bold("---------------------------------------------------------------"))
+        return []
+
+    account_keys = list(accounts.keys())
+    for idx, alias in enumerate(account_keys, start=1):
+        info = accounts[alias]
+        email = info.get("email", "unknown")
+        name = info.get("name", "")
+        profile_token = os.path.join(PROFILES_DIR, alias, "antigravity-oauth-token")
+
+        status_str = dim("Missing Token")
+        if os.path.exists(profile_token):
+            try:
+                with open(profile_token, "r") as f:
+                    tdata = json.load(f)
+                status_str = format_expiry(tdata.get("token", {}).get("expiry"))
+            except Exception:
+                status_str = red("Corrupted")
+
+        is_active = (alias == active)
+        marker = green("● ACTIVE  ") if is_active else dim("○         ")
+        prefix = f" [{idx}] {marker} {bold(alias.ljust(12))} "
+        print(f"{prefix} {cyan(email.ljust(28))} {status_str}")
+        if name:
+            print(f"       {dim('└─ ' + name)}")
+
+    print(bold("---------------------------------------------------------------"))
+    print()
+    return account_keys
+
+def switch_account(identifier):
+    init_vault()
+    accounts = load_accounts().get("profiles", {})
+    if not accounts:
+        print(red("No accounts available to switch. Run 'agy-switch add' first."))
+        return False
+
+    keys = list(accounts.keys())
+    target_alias = None
+
+    if identifier.isdigit():
+        idx = int(identifier) - 1
+        if 0 <= idx < len(keys):
+            target_alias = keys[idx]
+
+    if not target_alias:
+        for alias, meta in accounts.items():
+            if alias.lower() == identifier.lower() or meta.get("email", "").lower() == identifier.lower():
+                target_alias = alias
+                break
+
+    if not target_alias:
+        print(red(f"Error: Account matching '{identifier}' not found in vault."))
+        print(dim("Registered accounts:"))
+        for a, m in accounts.items():
+            print(f"  • {bold(a)} ({cyan(m.get('email'))})")
+        print()
+        if sys.stdin.isatty():
+            try:
+                ans = input(bold(f"Would you like to log in and add '{identifier}' now? [Y/n]: ")).strip().lower()
+                if ans in ("", "y", "yes"):
+                    return add_account(identifier)
+            except KeyboardInterrupt:
+                print()
+                return False
+        else:
+            print(yellow(f"To add this account, run: agy-switch add {identifier}"))
+        return False
+
+    # 1. Sync current token back to vault first
+    sync_active_token_to_vault()
+
+    # 2. Check target token
+    target_token_file = os.path.join(PROFILES_DIR, target_alias, "antigravity-oauth-token")
+    if not os.path.exists(target_token_file):
+        print(red(f"Error: Token file missing for profile '{target_alias}'."))
+        return False
+
+    with open(target_token_file, "r") as f:
+        tdata = json.load(f)
+
+    # 3. Ensure token is fresh
+    tdata, refreshed = ensure_valid_token(tdata)
+    if refreshed:
+        with open(target_token_file, "w") as f:
+            json.dump(tdata, f, indent=2)
+        safe_chmod_600(target_token_file)
+
+    # 4. Copy into agy CLI directory
+    os.makedirs(CLI_DIR, exist_ok=True)
+    with open(CLI_TOKEN_PATH, "w") as f:
+        json.dump(tdata, f, indent=2)
+    safe_chmod_600(CLI_TOKEN_PATH)
+
+    # 5. Set active
+    set_active_alias(target_alias)
+    accounts[target_alias]["last_used"] = datetime.now(timezone.utc).isoformat()
+    save_accounts({"profiles": accounts})
+
+    meta = accounts[target_alias]
+    print(green(f"✔ Successfully switched to account: {bold(target_alias)} ({cyan(meta.get('email'))})"))
+    if refreshed:
+        print(cyan("ℹ Token was refreshed automatically with a new 1-hour expiry."))
+    print(dim("ℹ All your sessions, conversations, and projects remain active & preserved."))
+    return True
+
+def add_account(alias=None):
+    init_vault()
+    sync_active_token_to_vault()
+
+    accounts = load_accounts().get("profiles", {})
+
+    print()
+    print(bold(cyan("=== Add New Antigravity Pro Account ===")))
+    print("This will launch the Google OAuth authentication flow.")
+    print("Sign in with your other Google Pro account in your browser,")
+    print("approve permissions, and paste the authorization code.\n")
+
+    suggested_alias = alias
+    if not suggested_alias:
+        default_name = f"account-{len(accounts) + 1}"
+        ans = input(f"Enter an alias/name for this account [{default_name}]: ").strip()
+        suggested_alias = ans if ans else default_name
+
+    clean_alias = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", suggested_alias)
+
+    staging_dir = os.path.join(VAULT_DIR, ".staging_login")
+    if os.path.exists(staging_dir):
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+    staging_cli_dir = os.path.join(staging_dir, ".gemini", "antigravity-cli")
+    os.makedirs(staging_cli_dir, exist_ok=True)
+
+    if os.path.exists(CLI_SETTINGS_PATH):
+        try:
+            shutil.copy2(CLI_SETTINGS_PATH, os.path.join(staging_cli_dir, "settings.json"))
+        except Exception:
+            pass
+
+    env = os.environ.copy()
+    env["HOME"] = staging_dir
+    # On Windows USERPROFILE serves as HOME
+    env["USERPROFILE"] = staging_dir
+
+    agy_bin = get_agy_bin()
+
+    print(bold("Launching login process..."))
+    print(yellow("Tip: If you're signed into Account 1 in your browser,"))
+    print(yellow("open the link in Incognito/Private mode to sign into your other account."))
+    print()
+
+    try:
+        p = subprocess.Popen(
+            [agy_bin, "--print", "Authentication successful", "--print-timeout", "180s"],
+            env=env
+        )
+        p.wait()
+    except KeyboardInterrupt:
+        print(yellow("\nLogin cancelled by user."))
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        return False
+    except Exception as e:
+        print(red(f"\nError running agy: {e}"))
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        return False
+
+    staged_token_path = os.path.join(staging_cli_dir, "antigravity-oauth-token")
+    if not os.path.exists(staged_token_path):
+        print(red("\nLogin failed or token was not generated."))
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        return False
+
+    try:
+        with open(staged_token_path, "r") as f:
+            tdata = json.load(f)
+
+        tok, _ = ensure_valid_token(tdata)
+        access_tok = tok.get("token", {}).get("access_token")
+        uinfo = fetch_user_info(access_tok)
+        email = uinfo.get("email", "unknown@google.com")
+        name = uinfo.get("name", "")
+
+        profile_dir = os.path.join(PROFILES_DIR, clean_alias)
+        os.makedirs(profile_dir, exist_ok=True)
+        target_token = os.path.join(profile_dir, "antigravity-oauth-token")
+        with open(target_token, "w") as f:
+            json.dump(tok, f, indent=2)
+        safe_chmod_600(target_token)
+
+        accounts[clean_alias] = {
+            "alias": clean_alias,
+            "email": email,
+            "name": name,
+            "added_at": datetime.now(timezone.utc).isoformat(),
+            "last_used": datetime.now(timezone.utc).isoformat()
+        }
+        save_accounts({"profiles": accounts})
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+        print()
+        print(green("✔ Account successfully added!"))
+        print(f"  Alias: {bold(clean_alias)}")
+        print(f"  Email: {cyan(email)}")
+        if name:
+            print(f"  Name:  {name}")
+
+        ans = input(f"\nDo you want to switch to '{clean_alias}' now? [Y/n]: ").strip().lower()
+        if ans in ("", "y", "yes"):
+            switch_account(clean_alias)
+        return True
+    except Exception as e:
+        print(red(f"Error saving account: {e}"))
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        return False
+
+def import_token(file_path, alias=None):
+    """Imports an existing antigravity-oauth-token JSON file."""
+    init_vault()
+    if not os.path.exists(file_path):
+        print(red(f"File not found: {file_path}"))
+        return False
+
+    try:
+        with open(file_path, "r") as f:
+            tdata = json.load(f)
+
+        if "token" not in tdata or "access_token" not in tdata["token"]:
+            print(red("Invalid token JSON format."))
+            return False
+
+        tdata, _ = ensure_valid_token(tdata)
+        access_tok = tdata.get("token", {}).get("access_token")
+        uinfo = fetch_user_info(access_tok)
+        email = uinfo.get("email", "imported@google.com")
+        name = uinfo.get("name", "")
+
+        accounts = load_accounts().get("profiles", {})
+        if not alias:
+            email_user = email.split("@")[0]
+            alias = re.sub(r"[^a-zA-Z0-9_\-]", "_", email_user)
+            if alias in accounts:
+                alias = f"{alias}-{len(accounts) + 1}"
+
+        profile_dir = os.path.join(PROFILES_DIR, alias)
+        os.makedirs(profile_dir, exist_ok=True)
+        target_token = os.path.join(profile_dir, "antigravity-oauth-token")
+        with open(target_token, "w") as f:
+            json.dump(tdata, f, indent=2)
+        safe_chmod_600(target_token)
+
+        accounts[alias] = {
+            "alias": alias,
+            "email": email,
+            "name": name,
+            "added_at": datetime.now(timezone.utc).isoformat(),
+            "last_used": datetime.now(timezone.utc).isoformat()
+        }
+        save_accounts({"profiles": accounts})
+        print(green(f"✔ Successfully imported token as '{bold(alias)}' ({cyan(email)})"))
+        return True
+    except Exception as e:
+        print(red(f"Import error: {e}"))
+        return False
+
+def export_token(alias, out_path):
+    init_vault()
+    sync_active_token_to_vault()
+    accounts = load_accounts().get("profiles", {})
+    if alias not in accounts:
+        print(red(f"Account '{alias}' not found."))
+        return False
+
+    src_token = os.path.join(PROFILES_DIR, alias, "antigravity-oauth-token")
+    if not os.path.exists(src_token):
+        print(red(f"Token file for '{alias}' does not exist."))
+        return False
+
+    shutil.copy2(src_token, out_path)
+    safe_chmod_600(out_path)
+    print(green(f"✔ Token for '{alias}' exported to: {out_path}"))
+    return True
+
+def remove_account(alias):
+    init_vault()
+    accounts = load_accounts().get("profiles", {})
+    if alias not in accounts:
+        print(red(f"Account '{alias}' not found."))
+        return False
+
+    active = get_active_alias()
+    if alias == active:
+        print(yellow(f"Warning: '{alias}' is the currently active account!"))
+        ans = input("Are you sure you want to delete the active account? [y/N]: ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("Aborted.")
+            return False
+
+    profile_dir = os.path.join(PROFILES_DIR, alias)
+    if os.path.exists(profile_dir):
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+    del accounts[alias]
+    save_accounts({"profiles": accounts})
+
+    if alias == active:
+        set_active_alias("")
+        if os.path.exists(CLI_TOKEN_PATH):
+            os.remove(CLI_TOKEN_PATH)
+        print(yellow("Active account removed. Antigravity CLI is now unauthenticated."))
+        remaining = list(accounts.keys())
+        if remaining:
+            print(f"Switching to '{remaining[0]}'...")
+            switch_account(remaining[0])
+    else:
+        print(green(f"✔ Removed account '{alias}'."))
+    return True
+
+def rename_account(old_alias, new_alias):
+    init_vault()
+    accounts = load_accounts().get("profiles", {})
+    if old_alias not in accounts:
+        print(red(f"Account '{old_alias}' not found."))
+        return False
+    if new_alias in accounts:
+        print(red(f"Account '{new_alias}' already exists."))
+        return False
+
+    clean_new = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", new_alias)
+    old_dir = os.path.join(PROFILES_DIR, old_alias)
+    new_dir = os.path.join(PROFILES_DIR, clean_new)
+    if os.path.exists(old_dir):
+        os.rename(old_dir, new_dir)
+
+    meta = accounts.pop(old_alias)
+    meta["alias"] = clean_new
+    accounts[clean_new] = meta
+    save_accounts({"profiles": accounts})
+
+    if get_active_alias() == old_alias:
+        set_active_alias(clean_new)
+
+    print(green(f"✔ Renamed '{old_alias}' to '{clean_new}'."))
+    return True
+
+def show_whoami():
+    init_vault()
+    sync_active_token_to_vault()
+    active = get_active_alias()
+    accounts = load_accounts().get("profiles", {})
+
+    print()
+    print(bold("=================================================="))
+    print(bold(cyan("         CURRENT ACTIVE AGY ACCOUNT              ")))
+    print(bold("=================================================="))
+
+    if not active or active not in accounts:
+        if os.path.exists(CLI_TOKEN_PATH):
+            try:
+                with open(CLI_TOKEN_PATH, "r") as f:
+                    tdata = json.load(f)
+                info = fetch_user_info(tdata.get("token", {}).get("access_token"))
+                print(f"  Status: {yellow('Unregistered active token')}")
+                print(f"  Email:  {cyan(info.get('email', 'unknown'))}")
+                print(f"  Expiry: {format_expiry(tdata.get('token', {}).get('expiry'))}")
+            except Exception:
+                print(red("  Active token unreadable or invalid."))
+        else:
+            print(yellow("  No active account logged in."))
+        print(bold("--------------------------------------------------"))
+        print()
+        return
+
+    meta = accounts[active]
+    profile_token = os.path.join(PROFILES_DIR, active, "antigravity-oauth-token")
+    status_str = dim("Token missing")
+    if os.path.exists(profile_token):
+        try:
+            with open(profile_token, "r") as f:
+                tdata = json.load(f)
+            status_str = format_expiry(tdata.get("token", {}).get("expiry"))
+        except Exception:
+            status_str = red("Corrupted")
+
+    print(f"  Profile Alias: {bold(green(active))}")
+    print(f"  Google Email:  {cyan(meta.get('email'))}")
+    if meta.get("name"):
+        print(f"  Account Name:  {meta.get('name')}")
+    print(f"  Token Health:  {status_str}")
+    print(f"  Sessions:      {green('Active & Preserved')}")
+    print(bold("--------------------------------------------------"))
+    print()
+
+def force_refresh(alias=None):
+    init_vault()
+    sync_active_token_to_vault()
+    target = alias or get_active_alias()
+    accounts = load_accounts().get("profiles", {})
+    if not target or target not in accounts:
+        print(red(f"Account '{target}' not found."))
+        return False
+
+    token_file = os.path.join(PROFILES_DIR, target, "antigravity-oauth-token")
+    if not os.path.exists(token_file):
+        print(red(f"Token file for '{target}' missing."))
+        return False
+
+    try:
+        with open(token_file, "r") as f:
+            tdata = json.load(f)
+        refreshed = refresh_oauth_token(tdata)
+        with open(token_file, "w") as f:
+            json.dump(refreshed, f, indent=2)
+        safe_chmod_600(token_file)
+
+        if target == get_active_alias():
+            with open(CLI_TOKEN_PATH, "w") as f:
+                json.dump(refreshed, f, indent=2)
+            safe_chmod_600(CLI_TOKEN_PATH)
+
+        print(green(f"✔ Token for '{target}' successfully refreshed!"))
+        print(f"  New Expiry: {format_expiry(refreshed.get('token', {}).get('expiry'))}")
+        return True
+    except Exception as e:
+        print(red(f"Refresh failed: {e}"))
+        return False
+
+def interactive_menu():
+    while True:
+        keys = list_accounts()
+        print(bold("Actions:"))
+        print(f"  [{bold('1-' + str(len(keys)) if keys else 'None')}] Switch to account")
+        print(f"  [{bold('a')}] Add new account (Login via Google OAuth)")
+        print(f"  [{bold('r')}] Force refresh token")
+        print(f"  [{bold('d')}] Delete an account")
+        print(f"  [{bold('i')}] Import token file")
+        print(f"  [{bold('w')}] Who am I (active details)")
+        print(f"  [{bold('q')}] Quit")
+        print()
+
+        try:
+            choice = input(bold("Select an action or account number: ")).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\nGoodbye!")
+            break
+
+        if choice in ("q", "exit", "quit", ""):
+            print("Goodbye!")
+            break
+        elif choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(keys):
+                switch_account(keys[idx - 1])
+                try: input("\nPress Enter to continue...")
+                except Exception: pass
+            else:
+                print(red("Invalid account number."))
+                time.sleep(1)
+        elif choice == "a":
+            add_account()
+            try: input("\nPress Enter to continue...")
+            except Exception: pass
+        elif choice == "r":
+            force_refresh()
+            try: input("\nPress Enter to continue...")
+            except Exception: pass
+        elif choice == "d":
+            target = input("Enter alias or number of account to delete: ").strip()
+            if target.isdigit():
+                idx = int(target)
+                if 1 <= idx <= len(keys):
+                    target = keys[idx - 1]
+            if target:
+                remove_account(target)
+            try: input("\nPress Enter to continue...")
+            except Exception: pass
+        elif choice == "i":
+            path = input("Enter path to token JSON file: ").strip()
+            al = input("Enter alias for this account (optional): ").strip() or None
+            import_token(path, al)
+            try: input("\nPress Enter to continue...")
+            except Exception: pass
+        elif choice == "w":
+            show_whoami()
+            try: input("\nPress Enter to continue...")
+            except Exception: pass
+        else:
+            print(red("Unknown option."))
+            time.sleep(1)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Universal Multi-Account Switcher for Antigravity CLI (agy)",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
+
+    subparsers.add_parser("list", aliases=["ls"], help="List all saved accounts")
+
+    sw_parser = subparsers.add_parser("switch", aliases=["use", "s"], help="Switch to an account")
+    sw_parser.add_argument("account", help="Account alias, index, or email")
+
+    add_parser = subparsers.add_parser("add", aliases=["login", "new"], help="Add a new Google account")
+    add_parser.add_argument("alias", nargs="?", default=None, help="Optional alias for the account")
+
+    subparsers.add_parser("whoami", aliases=["current", "status"], help="Show active account details")
+
+    rf_parser = subparsers.add_parser("refresh", help="Force refresh token for an account")
+    rf_parser.add_argument("alias", nargs="?", default=None, help="Account alias (defaults to active)")
+
+    rm_parser = subparsers.add_parser("remove", aliases=["rm", "delete"], help="Delete an account profile")
+    rm_parser.add_argument("alias", help="Account alias to remove")
+
+    rn_parser = subparsers.add_parser("rename", help="Rename an account alias")
+    rn_parser.add_argument("old", help="Old alias")
+    rn_parser.add_argument("new", help="New alias")
+
+    im_parser = subparsers.add_parser("import", help="Import token JSON file")
+    im_parser.add_argument("file", help="Path to antigravity-oauth-token JSON")
+    im_parser.add_argument("alias", nargs="?", default=None, help="Optional alias")
+
+    ex_parser = subparsers.add_parser("export", help="Export account token to a file")
+    ex_parser.add_argument("alias", help="Account alias")
+    ex_parser.add_argument("file", help="Destination file path")
+
+    subparsers.add_parser("sync", help="Sync currently active token to vault")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        interactive_menu()
+    elif args.command in ("list", "ls"):
+        list_accounts()
+    elif args.command in ("switch", "use", "s"):
+        switch_account(args.account)
+    elif args.command in ("add", "login", "new"):
+        add_account(args.alias)
+    elif args.command in ("whoami", "current", "status"):
+        show_whoami()
+    elif args.command == "refresh":
+        force_refresh(args.alias)
+    elif args.command in ("remove", "rm", "delete"):
+        remove_account(args.alias)
+    elif args.command == "rename":
+        rename_account(args.old, args.new)
+    elif args.command == "import":
+        import_token(args.file, args.alias)
+    elif args.command == "export":
+        export_token(args.alias, args.file)
+    elif args.command == "sync":
+        init_vault()
+        sync_active_token_to_vault()
+        print(green("✔ Active token successfully synchronized to vault."))
+
+if __name__ == "__main__":
+    main()
