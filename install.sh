@@ -97,7 +97,7 @@ agy() {
             agy-switch switch "$@"
         fi
     else
-        command agy "$@"
+        \command agy "$@"
     fi
 }
 '
@@ -149,8 +149,8 @@ for CFG in "${CONFIG_FILES[@]}"; do
     if ! grep -q "$TARGET_DIR" "$CFG" 2>/dev/null; then
         echo -e "\nexport PATH=\"$TARGET_DIR:\$PATH\"" >> "$CFG"
     fi
-    # Check if agy wrapper already present
-    if ! grep -q "Antigravity CLI (agy) Account Switcher integration" "$CFG" 2>/dev/null; then
+    # Only add shell function on non-Termux systems (Termux uses the native binary wrapper)
+    if [ "$IS_TERMUX" -eq 0 ] && ! grep -q "Antigravity CLI (agy) Account Switcher integration" "$CFG" 2>/dev/null; then
         echo -e "$WRAPPER_BLOCK" >> "$CFG"
     fi
 done
