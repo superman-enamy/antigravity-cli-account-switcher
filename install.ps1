@@ -64,6 +64,10 @@ function agy {
         } else {
             python "$destFile" switch `$args[1..`$args.Count]
         }
+    } elseif (`$args.Count -gt 0 -and (`$args[0] -eq 'quota' -or `$args[0] -eq 'usage' -or `$args[0] -eq 'verify' -or `$args[0] -eq 'check')) {
+        python "$destFile" check `$args[1..`$args.Count]
+    } elseif (`$args.Count -gt 0 -and `$args[0] -eq 'refresh') {
+        python "$destFile" refresh `$args[1..`$args.Count]
     } else {
         & (Get-Command agy.exe -CommandType Application).Source @args
     }

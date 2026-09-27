@@ -136,13 +136,57 @@ agy-switch whoami
 | `agy switch` | `agy-switch` | Launch the interactive selection menu |
 | `agy switch <target>` | `agy-switch switch <target>` | Switch active account by alias, number, or email |
 | `agy-switch add [alias]` | `agy-switch login` | Add and authenticate a new Google account |
+| `agy quota [alias]` | `agy usage`, `agy verify` | Live rate limits (Gemini, Claude, GPT) & instant verification link |
+| `agy refresh [alias]` | `agy-switch refresh` | Proactively refresh an account's token with Google |
 | `agy-switch whoami` | `agy-switch status` | Inspect the currently active account |
-| `agy-switch refresh [alias]` | — | Proactively refresh an account's token with Google |
 | `agy-switch remove <alias>` | `agy-switch rm` | Delete an account from the vault |
 | `agy-switch rename <old> <new>` | — | Rename an account alias |
 | `agy-switch import <file> [alias]` | — | Import an existing `antigravity-oauth-token` JSON file |
 | `agy-switch export <alias> <file>` | — | Export an account's token JSON for backup/transfer |
 | `agy-switch sync` | — | Sync latest refreshed token from CLI to vault |
+
+---
+
+## 💡 Troubleshooting & Crucial Tips
+
+### 1. ⚠️ Google Verification Trap ("Eligibility check failed: Verify your account")
+If Google prompts you with an account verification link during startup or after switching accounts:
+
+```text
+Eligibility Check
+  ⎿ Eligibility check failed: Your current account is not eligible for Antigravity.
+    Verify your account to continue.
+    Alternatively, try signing in with another personal Google account.
+    Please verify your account in your browser to continue:
+    https://accounts.google.com/signin/continue?sarp=1&scc=1&...&flowName=GlifWebSignIn&authuser
+```
+
+> [!IMPORTANT]
+> **Two Essential Steps to Prevent Endless Verification Loops:**
+>
+> 1. **Open Link in Incognito / Private Tab**:
+>    On mobile (especially Android / Chrome), clicking the link directly defaults to **Account 0** (your primary device account). Even if you complete the verification screen, Google will have verified your *primary* account instead of the *secondary* account you just switched to!  
+>    **Fix:** Long-press/copy the URL, open a **Private / Incognito tab** in your browser, and sign in with the **exact Google email** being verified.
+>
+> 2. **Run `agy-switch refresh` Immediately After Verification**:
+>    ```bash
+>    agy-switch refresh
+>    ```
+>    Once you see `auth_success_gemini` in your browser, Google's backend marks your account as verified. However, the local OAuth access token cached on your machine still carries the previous unverified state. Running `agy-switch refresh` forces Google's OAuth endpoint to issue a brand-new access token with the updated eligibility claims!
+>
+> 3. **Restart / Resume your session**:
+>    ```bash
+>    agy -c
+>    ```
+
+---
+
+### 2. 🔄 Switching Accounts Across Multiple Terminals
+* The `agy` CLI loads credentials into memory when launched. If Terminal 1 is running an active session and you run `agy switch <account>` in Terminal 2, Terminal 1 will **not** switch accounts mid-conversation.
+* **Best Practice Workflow**:
+  1. In your active CLI session, type `/exit` (or press `Ctrl+D`).
+  2. Switch account: `agy switch <alias>`
+  3. Resume your exact conversation: `agy -c` (all context, tools, and history are preserved).
 
 ---
 

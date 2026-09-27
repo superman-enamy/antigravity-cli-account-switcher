@@ -96,6 +96,12 @@ agy() {
         else
             agy-switch switch "$@"
         fi
+    elif [ "$1" = "quota" ] || [ "$1" = "usage" ] || [ "$1" = "verify" ] || [ "$1" = "check" ]; then
+        shift
+        agy-switch check "$@"
+    elif [ "$1" = "refresh" ]; then
+        shift
+        agy-switch refresh "$@"
     else
         \command agy "$@"
     fi
@@ -123,6 +129,12 @@ if [ "$1" = "switch" ]; then
 elif [ "$1" = "accounts" ] || [ "$1" = "account" ]; then
     shift
     exec /data/data/com.termux/files/usr/bin/agy-switch list "$@"
+elif [ "$1" = "quota" ] || [ "$1" = "usage" ] || [ "$1" = "verify" ] || [ "$1" = "check" ]; then
+    shift
+    exec /data/data/com.termux/files/usr/bin/agy-switch check "$@"
+elif [ "$1" = "refresh" ]; then
+    shift
+    exec /data/data/com.termux/files/usr/bin/agy-switch refresh "$@"
 else
     exec /data/data/com.termux/files/usr/bin/agy-real "$@"
 fi

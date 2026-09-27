@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/data/data/com.termux/files/usr/bin/env python3
 """
 agy-switch: Universal Multi-Account Switcher for Google Antigravity CLI (agy)
 Works across Android Termux, Linux, macOS, and Windows.
@@ -69,6 +69,26 @@ def get_agy_bin():
             return candidate
 
     return "agy"
+
+def check_running_agy():
+    """Detects if another agy process is currently running."""
+    try:
+        out = subprocess.check_output(["ps", "-eo", "pid,comm,args"], text=True)
+        running = []
+        my_pid = os.getpid()
+        for line in out.strip().splitlines()[1:]:
+            parts = line.split(None, 2)
+            if len(parts) >= 3:
+                pid, comm, args = parts[0], parts[1], parts[2]
+                if "agy.va39" in args or ("agy" in comm and "agy-switch" not in args and "grep" not in args):
+                    try:
+                        if int(pid) != my_pid:
+                            running.append(pid)
+                    except Exception:
+                        pass
+        return running
+    except Exception:
+        return []
 
 # --- Styling & Colors ---
 IS_TTY = sys.stdout.isatty()
@@ -194,6 +214,46 @@ def ensure_valid_token(token_data):
         except Exception:
             return token_data, False
     return token_data, False
+
+def check_quota_and_verification(access_token):
+    """Queries Google Antigravity Code Assist retrieveUserQuotaSummary endpoint.
+    Returns:
+      {"status": "ok", "groups": [...]}
+      {"status": "validation_required", "url": "...", "message": "..."}
+      {"status": "error", "code": int, "message": str}
+    """
+    endpoints = [
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+    ]
+    for url in endpoints:
+        req = urllib.request.Request(url, data=b"{}", headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "antigravity"
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+                return {"status": "ok", "groups": data.get("groups", [])}
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode()
+            try:
+                err_json = json.loads(err_body)
+                for detail in err_json.get("error", {}).get("details", []):
+                    meta = detail.get("metadata", {})
+                    if meta.get("validation_url"):
+                        return {
+                            "status": "validation_required",
+                            "url": meta.get("validation_url"),
+                            "message": meta.get("validation_error_message", "Verify your account to continue.")
+                        }
+            except Exception:
+                pass
+            return {"status": "error", "code": e.code, "message": f"HTTP {e.code}"}
+        except Exception:
+            continue
+    return {"status": "error", "message": "Could not connect to Google Code Assist backend"}
 
 # --- Vault Storage ---
 def init_vault():
@@ -403,6 +463,18 @@ def switch_account(identifier):
     if refreshed:
         print(cyan("ℹ Token was refreshed automatically with a new 1-hour expiry."))
     print(dim("ℹ All your sessions, conversations, and projects remain active & preserved."))
+
+    # Immediate quota & verification check
+    check_and_handle_verification(target_alias, tdata, interactive=True)
+
+    running = check_running_agy()
+    if running:
+        print(yellow(f"\n⚠️  Notice: An active 'agy' session is running in another terminal (PID: {', '.join(running)})."))
+        print(dim("   'agy' holds credentials in memory, so that running session will not switch mid-flight."))
+        print(bold(cyan("   To use the new account on that chat:")))
+        print(bold(cyan("   1. Type /exit (or Ctrl+D) in the other terminal")))
+        print(bold(cyan("   2. Resume your exact chat: agy -c\n")))
+
     return True
 
 def add_account(alias=None):
@@ -688,8 +760,232 @@ def show_whoami():
         print(f"  Account Name:  {meta.get('name')}")
     print(f"  Token Health:  {status_str}")
     print(f"  Sessions:      {green('Active & Preserved')}")
+    if os.path.exists(profile_token):
+        try:
+            check_and_handle_verification(active, tdata, interactive=False)
+        except Exception:
+            pass
     print(bold("--------------------------------------------------"))
     print()
+
+def check_and_handle_verification(alias, tdata, interactive=True):
+    """
+    Checks quota/eligibility immediately after an account switch or refresh.
+    If Google requires verification, prints the link with step-by-step guidance
+    and provides an interactive prompt to auto-refresh token upon verification.
+    """
+    token = tdata.get("token", {}).get("access_token")
+    if not token:
+        return False
+
+    email = None
+    accounts = load_accounts().get("profiles", {})
+    if alias in accounts:
+        email = accounts[alias].get("email")
+
+    res = check_quota_and_verification(token)
+    if res["status"] == "ok":
+        groups = res.get("groups", [])
+        quota_parts = []
+        for g in groups:
+            dname = g.get("displayName", "")
+            short_name = "Gemini" if "Gemini" in dname else ("Claude/GPT" if "Claude" in dname else dname)
+            buckets = g.get("buckets", [])
+            b_5h = next((b for b in buckets if b.get("window") == "5h"), None)
+            b_wk = next((b for b in buckets if b.get("window") == "weekly"), None)
+            if b_5h:
+                pct = int(b_5h.get("remainingFraction", 0) * 100)
+                quota_parts.append(f"{short_name} (5h: {pct}%)")
+            elif b_wk:
+                pct = int(b_wk.get("remainingFraction", 0) * 100)
+                quota_parts.append(f"{short_name} (wk: {pct}%)")
+
+        if quota_parts:
+            print(dim("   Live Quota: ") + cyan(" | ".join(quota_parts)))
+        return True
+
+    elif res["status"] == "validation_required":
+        print()
+        print(bold(yellow("===============================================================")))
+        print(bold(yellow("   ⚠️  ACTION REQUIRED: GOOGLE ACCOUNT VERIFICATION NEEDED!   ")))
+        print(bold(yellow("===============================================================")))
+        print(red("Google requires identity verification for this account before granting API quota."))
+        print(bold(cyan("\n🔗 Direct Verification Link:")))
+        print(style(res["url"], 4, 36))
+        print()
+        print(bold(yellow("👉 STEP 1:")) + f" Copy the link above and open in an {bold('INCOGNITO / PRIVATE tab')}.")
+        if email:
+            print(f"         Sign in specifically as: {bold(cyan(email))}")
+            print(dim("         (Do NOT open in regular Chrome if another Google account is default!)"))
+        print(bold(yellow("👉 STEP 2:")) + " Complete the verification prompt in your browser.")
+        print()
+
+        if interactive and sys.stdin.isatty():
+            try:
+                input(bold(green("👉 STEP 3: Press [Enter] here once verified in browser to auto-refresh... ")))
+                print(cyan("\nRefreshing token and validating with Google..."))
+                new_tdata = refresh_oauth_token(tdata)
+                token_file = os.path.join(PROFILES_DIR, alias, "antigravity-oauth-token")
+                with open(token_file, "w") as f:
+                    json.dump(new_tdata, f, indent=2)
+                safe_chmod_600(token_file)
+
+                if alias == get_active_alias():
+                    with open(CLI_TOKEN_PATH, "w") as f:
+                        json.dump(new_tdata, f, indent=2)
+                    safe_chmod_600(CLI_TOKEN_PATH)
+
+                recheck = check_quota_and_verification(new_tdata.get("token", {}).get("access_token"))
+                if recheck["status"] == "ok":
+                    print(bold(green("\n✔ Account successfully verified and refreshed!")))
+                    print(green(f"✔ Ready to code: {bold('agy -c')}\n"))
+                    return True
+                else:
+                    print(yellow("\n⚠️ Verification is still pending on Google. When finished in browser, run:"))
+                    print(bold(cyan("   agy-switch refresh\n")))
+                    return False
+            except (KeyboardInterrupt, EOFError):
+                print(yellow("\n\nSkipped. Run ") + bold(cyan("agy-switch refresh")) + yellow(" once verified.\n"))
+                return False
+        else:
+            print(bold(yellow("👉 STEP 3:")) + " Run " + bold(cyan("agy-switch refresh")) + " in your terminal.")
+            print()
+            return False
+
+    return False
+
+def show_quota(target_alias=None):
+    """Displays real-time Google quota (Gemini, Claude, GPT) and detects if verification is needed."""
+    init_vault()
+    sync_active_token_to_vault()
+    accounts = load_accounts().get("profiles", {})
+    if not accounts:
+        print(red("No accounts found in vault. Run 'agy-switch add' to add one."))
+        return False
+
+    if not target_alias:
+        target_alias = get_active_alias() or list(accounts.keys())[0]
+
+    if target_alias not in accounts:
+        matched = None
+        for a, m in accounts.items():
+            if m.get("email") == target_alias:
+                matched = a
+                break
+        if not matched and target_alias.isdigit():
+            idx = int(target_alias)
+            keys = list(accounts.keys())
+            if 1 <= idx <= len(keys):
+                matched = keys[idx - 1]
+        if matched:
+            target_alias = matched
+        else:
+            print(red(f"Account '{target_alias}' not found in vault."))
+            return False
+
+    meta = accounts[target_alias]
+    token_file = os.path.join(PROFILES_DIR, target_alias, "antigravity-oauth-token")
+    if not os.path.exists(token_file):
+        print(red(f"Token file missing for '{target_alias}'."))
+        return False
+
+    with open(token_file, "r") as f:
+        tdata = json.load(f)
+
+    tdata, refreshed = ensure_valid_token(tdata)
+    if refreshed:
+        with open(token_file, "w") as f:
+            json.dump(tdata, f, indent=2)
+        safe_chmod_600(token_file)
+        if target_alias == get_active_alias():
+            with open(CLI_TOKEN_PATH, "w") as f:
+                json.dump(tdata, f, indent=2)
+            safe_chmod_600(CLI_TOKEN_PATH)
+
+    access_token = tdata.get("token", {}).get("access_token")
+    if not access_token:
+        print(red("No access token found in profile."))
+        return False
+
+    print()
+    print(bold(cyan("===============================================================")))
+    print(bold(cyan("           ANTIGRAVITY LIVE QUOTA & ELIGIBILITY STATUS         ")))
+    print(bold(cyan("===============================================================")))
+    print(f"  Account: {bold(target_alias)} ({cyan(meta.get('email'))})")
+
+    res = check_quota_and_verification(access_token)
+    if res["status"] == "ok":
+        print(f"  Status:  {bold(green('✔ Verified & Eligible'))}\n")
+        groups = res.get("groups", [])
+        for g in groups:
+            name = g.get("displayName", "Models")
+            print(f"● {bold(name)}:")
+            for b in g.get("buckets", []):
+                dname = b.get("displayName", b.get("window", ""))
+                rem = b.get("remainingFraction", 0)
+                pct = int(rem * 100)
+                if pct > 40:
+                    pct_str = green(f"{pct}%")
+                elif pct > 10:
+                    pct_str = yellow(f"{pct}%")
+                else:
+                    pct_str = red(f"{pct}%")
+                print(f"  └─ {dname.ljust(28)}: {pct_str} remaining")
+                desc_line = b.get("description", "")
+                if desc_line:
+                    print(f"     {dim(desc_line)}")
+            print()
+        print(dim("---------------------------------------------------------------"))
+        print(dim("ℹ Tip: When limits are exhausted, switch accounts instantly with: ") + bold(cyan("agy switch")))
+        print()
+        return True
+
+    elif res["status"] == "validation_required":
+        print(f"  Status:  {bold(red('⚠️ Google Verification Required!'))}\n")
+        print(red("Google requires security verification for this account before granting API quota."))
+        print(bold(cyan("\n🔗 Direct Verification Link:")))
+        print(style(res["url"], 4, 36))
+        print()
+        print(bold(yellow("👉 STEP 1:")) + f" Copy the link and open it in an {bold('INCOGNITO / PRIVATE tab')}.")
+        print(f"         Sign in specifically as: {bold(cyan(meta.get('email')))}")
+        print(dim("         (Avoid opening in regular browser if another account is default!)"))
+        print(bold(yellow("👉 STEP 2:")) + " Complete the verification on screen.")
+        print()
+
+        if sys.stdin.isatty():
+            try:
+                input(bold(green("👉 STEP 3: Press [Enter] here once verified in browser to auto-refresh... ")))
+                print(cyan("\nRefreshing token and validating with Google..."))
+                new_tdata = refresh_oauth_token(tdata)
+                with open(token_file, "w") as f:
+                    json.dump(new_tdata, f, indent=2)
+                safe_chmod_600(token_file)
+
+                if target_alias == get_active_alias():
+                    with open(CLI_TOKEN_PATH, "w") as f:
+                        json.dump(new_tdata, f, indent=2)
+                    safe_chmod_600(CLI_TOKEN_PATH)
+
+                recheck = check_quota_and_verification(new_tdata.get("token", {}).get("access_token"))
+                if recheck["status"] == "ok":
+                    print(bold(green("\n✔ Account successfully verified and refreshed!")))
+                    print(green(f"✔ Ready to code: {bold('agy -c')}\n"))
+                    return True
+                else:
+                    print(yellow("\n⚠️ Verification is still pending. Once finished in browser, run:"))
+                    print(bold(cyan("   agy-switch refresh\n")))
+                    return False
+            except (KeyboardInterrupt, EOFError):
+                print(yellow("\n\nSkipped. Run ") + bold(cyan("agy-switch refresh")) + yellow(" once verified.\n"))
+                return False
+        else:
+            print(bold(yellow("👉 STEP 3:")) + " Run " + bold(cyan("agy-switch refresh")) + " after verifying.")
+            print()
+            return False
+    else:
+        print(f"  Status:  {yellow('Could not retrieve quota (' + res.get('message', 'unknown error') + ')')}")
+        print()
+        return False
 
 def force_refresh(alias=None):
     init_vault()
@@ -720,6 +1016,7 @@ def force_refresh(alias=None):
 
         print(green(f"✔ Token for '{target}' successfully refreshed!"))
         print(f"  New Expiry: {format_expiry(refreshed.get('token', {}).get('expiry'))}")
+        check_and_handle_verification(target, refreshed, interactive=True)
         return True
     except Exception as e:
         print(red(f"Refresh failed: {e}"))
@@ -730,6 +1027,7 @@ def interactive_menu():
         keys = list_accounts()
         print(bold("Actions:"))
         print(f"  [{bold('1-' + str(len(keys)) if keys else 'None')}] Switch to account")
+        print(f"  [{bold('v')}] View live quota & verification status")
         print(f"  [{bold('a')}] Add new account (Login via Google OAuth)")
         print(f"  [{bold('r')}] Force refresh token")
         print(f"  [{bold('d')}] Delete an account")
@@ -756,6 +1054,10 @@ def interactive_menu():
             else:
                 print(red("Invalid account number."))
                 time.sleep(1)
+        elif choice in ("v", "quota", "usage", "verify"):
+            show_quota()
+            try: input("\nPress Enter to continue...")
+            except Exception: pass
         elif choice == "a":
             add_account()
             try: input("\nPress Enter to continue...")
@@ -800,6 +1102,9 @@ def main():
     sw_parser = subparsers.add_parser("switch", aliases=["use", "s"], help="Switch to an account")
     sw_parser.add_argument("account", help="Account alias, index, or email")
 
+    ck_parser = subparsers.add_parser("check", aliases=["quota", "usage", "verify"], help="Check live quota and account verification status")
+    ck_parser.add_argument("alias", nargs="?", default=None, help="Account alias (defaults to active)")
+
     add_parser = subparsers.add_parser("add", aliases=["login", "new"], help="Add a new Google account")
     add_parser.add_argument("alias", nargs="?", default=None, help="Optional alias for the account")
 
@@ -833,6 +1138,8 @@ def main():
         list_accounts()
     elif args.command in ("switch", "use", "s"):
         switch_account(args.account)
+    elif args.command in ("check", "quota", "usage", "verify"):
+        show_quota(args.alias)
     elif args.command in ("add", "login", "new"):
         add_account(args.alias)
     elif args.command in ("whoami", "current", "status"):
