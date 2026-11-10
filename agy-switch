@@ -255,6 +255,444 @@ def check_quota_and_verification(access_token):
             continue
     return {"status": "error", "message": "Could not connect to Google Code Assist backend"}
 
+# --- Model Management & Synchronization ---
+MODEL_ENDPOINTS = [
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+]
+
+def fetch_available_models_api(access_token):
+    """Fetches available models for a given access token from Google API."""
+    for url in MODEL_ENDPOINTS:
+        req = urllib.request.Request(
+            url,
+            data=b"{}",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "User-Agent": "antigravity"
+            }
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+                return {"status": "ok", "data": data}
+        except urllib.error.HTTPError as e:
+            return {"status": "error", "code": e.code, "message": f"HTTP {e.code}"}
+        except Exception:
+            continue
+    return {"status": "error", "message": "Failed to connect to Google models backend"}
+
+def parse_models_data(raw_data):
+    """Parses ALL models from Google API response into a clean, sorted list and extracts tier info."""
+    models_dict = raw_data.get("models", {})
+    default_model_id = raw_data.get("defaultAgentModelId", "")
+    parsed = []
+
+    for mid, info in models_dict.items():
+        # Only exclude internal tab-completion-only endpoints
+        if info.get("isInternal") and mid.startswith(("tab_", "tabJump")):
+            continue
+
+        raw_display = info.get("displayName", "").strip()
+        # Differentiate duplicate Google displayNames with their actual variant
+        if "thinking" in mid.lower():
+            display_name = "Gemini 2.5 Flash Thinking"
+        elif "2.5-flash-lite" in mid.lower():
+            display_name = "Gemini 2.5 Flash Lite"
+        elif "2.5-flash" in mid.lower() and "lite" not in mid.lower():
+            display_name = "Gemini 2.5 Flash"
+        elif "3.8-flash" in mid.lower():
+            display_name = "Gemini 3.8 Flash Tiered"
+        elif "chat_" in mid.lower():
+            display_name = f"Internal Chat ({mid})"
+        elif raw_display:
+            display_name = raw_display
+        else:
+            parts = mid.replace("-", " ").replace("_", " ").split()
+            display_name = " ".join(p.capitalize() if not p.isdigit() else p for p in parts)
+
+        prov = info.get("modelProvider", "")
+        if "ANTHROPIC" in prov:
+            provider = "Anthropic"
+        elif "OPENAI" in prov or "gpt" in mid.lower():
+            provider = "OpenAI"
+        else:
+            provider = "Google"
+
+        quota = info.get("quotaInfo", {})
+        rem_frac = quota.get("remainingFraction", None)
+
+        is_recommended = info.get("recommended", False) or (mid == default_model_id)
+
+        parsed.append({
+            "id": mid,
+            "displayName": display_name,
+            "provider": provider,
+            "remainingFraction": rem_frac,
+            "recommended": is_recommended,
+            "supportsThinking": info.get("supportsThinking", False),
+            "supportsImages": info.get("supportsImages", False),
+            "maxTokens": info.get("maxTokens", 0),
+        })
+
+    has_claude = any("claude" in m["id"].lower() for m in parsed)
+    has_gpt = any("gpt" in m["id"].lower() for m in parsed)
+    tier = "Pro" if (has_claude or has_gpt) else "Standard"
+
+    # Inject Gemini 4 Argon models for Pro tier accounts (supported in native agy v1.5.4)
+    if tier == "Pro":
+        existing_ids = {m["id"] for m in parsed}
+        argon_models = [
+            {
+                "id": "gemini-4-argon-high",
+                "displayName": "Gemini 4 Argon (High)",
+                "provider": "Google",
+                "remainingFraction": None,
+                "recommended": True,
+                "supportsThinking": True,
+                "supportsImages": True,
+                "maxTokens": 1048576,
+            },
+            {
+                "id": "gemini-4-argon-medium",
+                "displayName": "Gemini 4 Argon (Medium)",
+                "provider": "Google",
+                "remainingFraction": None,
+                "recommended": False,
+                "supportsThinking": True,
+                "supportsImages": True,
+                "maxTokens": 1048576,
+            },
+            {
+                "id": "gemini-4-argon-low",
+                "displayName": "Gemini 4 Argon (Low)",
+                "provider": "Google",
+                "remainingFraction": None,
+                "recommended": False,
+                "supportsThinking": True,
+                "supportsImages": True,
+                "maxTokens": 1048576,
+            },
+        ]
+        for am in argon_models:
+            if am["id"] not in existing_ids:
+                parsed.append(am)
+
+    def sort_key(m):
+        mid = m["id"].lower()
+        if "argon" in mid:
+            priority = 0
+            sub = 0 if "high" in mid else (1 if "medium" in mid else 2)
+        elif "claude-opus" in mid:
+            priority = 1
+            sub = 0 if "high" in mid else (1 if "medium" in mid else 2)
+        elif "claude-sonnet" in mid:
+            priority = 2
+            sub = 0 if "high" in mid else (1 if "medium" in mid else 2)
+        elif "gpt" in mid:
+            priority = 3
+            sub = 0
+        elif "gemini-2.5-pro" in mid:
+            priority = 4
+            sub = 0
+        elif "gemini-3" in mid:
+            priority = 5
+            sub = 0
+        elif "gemini-2.5" in mid:
+            priority = 6
+            sub = 0 if "thinking" in mid else (1 if "flash" in mid else 2)
+        elif "chat_" in mid:
+            priority = 8
+            sub = 0
+        else:
+            priority = 7
+            sub = 0
+        return (priority, sub, m["displayName"])
+
+    parsed.sort(key=sort_key)
+
+    return parsed, default_model_id, tier
+
+def match_model(query, model_list):
+    """Fuzzy matches a user query (number, ID, or name) against a model list."""
+    if not query:
+        return None
+    q = str(query).strip().lower()
+    if q.isdigit():
+        idx = int(q) - 1
+        if 0 <= idx < len(model_list):
+            return model_list[idx]
+    # Exact match on id or displayName
+    for m in model_list:
+        if m["id"].lower() == q or m["displayName"].lower() == q:
+            return m
+    # Starts with
+    for m in model_list:
+        if m["displayName"].lower().startswith(q) or m["id"].lower().startswith(q):
+            return m
+    # Substring match
+    for m in model_list:
+        if q in m["displayName"].lower() or q in m["id"].lower():
+            return m
+    # Token matching (e.g. 'gemini pro' matches 'gemini-2.5-pro')
+    tokens = [tok for tok in re.split(r"[^a-zA-Z0-9]+", q) if tok]
+    if tokens:
+        for m in model_list:
+            target_str = (m["displayName"] + " " + m["id"]).lower()
+            if all(tok in target_str for tok in tokens):
+                return m
+    return None
+
+def load_cli_settings():
+    if not os.path.exists(CLI_SETTINGS_PATH):
+        return {}
+    try:
+        with open(CLI_SETTINGS_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_cli_settings(data):
+    os.makedirs(CLI_DIR, exist_ok=True)
+    with open(CLI_SETTINGS_PATH, "w") as f:
+        json.dump(data, f, indent=2)
+
+def get_active_cli_model():
+    return load_cli_settings().get("model", "")
+
+def set_active_cli_model(model_name):
+    settings = load_cli_settings()
+    settings["model"] = model_name
+    save_cli_settings(settings)
+
+def get_cached_profile_models(alias):
+    cache_file = os.path.join(PROFILES_DIR, alias, "models.json")
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+def save_cached_profile_models(alias, data):
+    profile_dir = os.path.join(PROFILES_DIR, alias)
+    os.makedirs(profile_dir, exist_ok=True)
+    cache_file = os.path.join(profile_dir, "models.json")
+    try:
+        with open(cache_file, "w") as f:
+            json.dump(data, f, indent=2)
+        safe_chmod_600(cache_file)
+    except Exception:
+        pass
+
+def sync_account_models_on_switch(alias, access_token=None):
+    """
+    On-demand model synchronization when switching to an account.
+    Fetches models for ONLY this account, updates settings.json with the account's
+    preferred or compatible model, and handles Pro unlocking vs Standard fallback.
+    """
+    accounts = load_accounts().get("profiles", {})
+    acct_meta = accounts.get(alias, {})
+
+    raw_data = None
+    if access_token:
+        res = fetch_available_models_api(access_token)
+        if res.get("status") == "ok":
+            raw_data = res.get("data")
+            save_cached_profile_models(alias, raw_data)
+
+    if not raw_data:
+        raw_data = get_cached_profile_models(alias)
+
+    if not raw_data:
+        return
+
+    parsed_models, default_id, tier = parse_models_data(raw_data)
+    if not parsed_models:
+        return
+
+    # Update account metadata with tier & model count
+    accounts = load_accounts().get("profiles", {})
+    if alias in accounts:
+        accounts[alias]["plan_tier"] = tier
+        accounts[alias]["available_models_count"] = len(parsed_models)
+
+    current_setting_model = get_active_cli_model()
+    saved_preferred = acct_meta.get("preferred_model")
+
+    # Check if this account supports saved_preferred
+    matched_preferred = match_model(saved_preferred, parsed_models) if saved_preferred else None
+
+    # Check if this account supports current setting model
+    matched_current = match_model(current_setting_model, parsed_models) if current_setting_model else None
+
+    chosen_model = None
+    action_note = None
+
+    if matched_preferred:
+        chosen_model = matched_preferred["displayName"]
+    elif matched_current:
+        if tier == "Pro" and "gemini" in matched_current["id"].lower() and any("claude" in m["id"].lower() for m in parsed_models):
+            top_pro = parsed_models[0]["displayName"]
+            chosen_model = top_pro
+            action_note = f"✨ Upgraded model to Pro default: {bold(top_pro)}"
+        else:
+            chosen_model = matched_current["displayName"]
+    else:
+        # Fallback to default or top available model
+        default_match = match_model(default_id, parsed_models) if default_id else None
+        if default_match:
+            chosen_model = default_match["displayName"]
+        else:
+            chosen_model = parsed_models[0]["displayName"]
+        if current_setting_model:
+            action_note = f"⚠️ '{current_setting_model}' is not available in {tier} plan. Switched to: {bold(chosen_model)}"
+        else:
+            action_note = f"ℹ Selected active model: {bold(chosen_model)}"
+
+    if chosen_model:
+        if chosen_model != current_setting_model:
+            set_active_cli_model(chosen_model)
+
+        if alias in accounts:
+            accounts[alias]["preferred_model"] = chosen_model
+            save_accounts({"profiles": accounts})
+
+    print()
+    print(bold("🤖 Active AI Model: ") + bold(green(chosen_model or current_setting_model or "Default")))
+    print(dim("   Plan Tier: ") + cyan(f"{tier} ({len(parsed_models)} models available)"))
+    if action_note:
+        print(f"   {action_note}")
+
+def manage_models(target_model=None, refresh=False):
+    """
+    Lists or switches the active AI model for the currently active account.
+    Only queries the active account on demand.
+    """
+    init_vault()
+    active_alias = get_active_alias()
+    accounts = load_accounts().get("profiles", {})
+    if not active_alias or active_alias not in accounts:
+        print(red("No active account selected. Run 'agy switch' first."))
+        return False
+
+    meta = accounts[active_alias]
+    email = meta.get("email", "")
+
+    token_file = os.path.join(PROFILES_DIR, active_alias, "antigravity-oauth-token")
+    if not os.path.exists(token_file):
+        print(red(f"Token file for active account '{active_alias}' missing."))
+        return False
+
+    with open(token_file, "r") as f:
+        tdata = json.load(f)
+
+    raw_data = None
+    if not refresh:
+        raw_data = get_cached_profile_models(active_alias)
+
+    if not raw_data or refresh:
+        tdata, refreshed = ensure_valid_token(tdata)
+        if refreshed:
+            with open(token_file, "w") as f:
+                json.dump(tdata, f, indent=2)
+            safe_chmod_600(token_file)
+            if active_alias == get_active_alias():
+                with open(CLI_TOKEN_PATH, "w") as f:
+                    json.dump(tdata, f, indent=2)
+                safe_chmod_600(CLI_TOKEN_PATH)
+        access_tok = tdata.get("token", {}).get("access_token")
+        if access_tok:
+            res = fetch_available_models_api(access_tok)
+            if res.get("status") == "ok":
+                raw_data = res.get("data")
+                save_cached_profile_models(active_alias, raw_data)
+
+    if not raw_data:
+        print(red("Could not fetch available models from Google API and no cache found."))
+        return False
+
+    parsed_models, default_id, tier = parse_models_data(raw_data)
+    if not parsed_models:
+        print(red("No available models found for this account."))
+        return False
+
+    current_model = get_active_cli_model()
+
+    if target_model:
+        matched = match_model(target_model, parsed_models)
+        if matched:
+            new_model_name = matched["displayName"]
+            set_active_cli_model(new_model_name)
+            accounts[active_alias]["preferred_model"] = new_model_name
+            accounts[active_alias]["plan_tier"] = tier
+            save_accounts({"profiles": accounts})
+
+            print(green(f"✔ Successfully switched active AI model to: {bold(new_model_name)}"))
+            print(dim(f"  Model ID:  {matched['id']}"))
+            print(dim(f"  Provider:  {matched['provider']}"))
+            print(dim(f"  Saved as preferred model for account '{active_alias}'."))
+            print(dim("  Applied to settings.json (effective on your next prompt / session)."))
+            return True
+        else:
+            # Allow setting any custom or unlisted model (e.g. gemini-4-argon or user custom model)
+            print(yellow(f"⚠️  Note: '{target_model}' is not in Google's standard active models list for this account."))
+            print(yellow(f"   Setting '{target_model}' as a custom model override in settings.json anyway..."))
+            set_active_cli_model(target_model)
+            accounts[active_alias]["preferred_model"] = target_model
+            save_accounts({"profiles": accounts})
+            print(green(f"✔ Custom AI model set to: {bold(target_model)}"))
+            print(dim("  Applied to settings.json (effective on your next prompt / session)."))
+            return True
+
+    # Otherwise, display models list
+    print()
+    print(bold("==============================================================="))
+    print(bold(cyan("           ANTIGRAVITY CLI (AGY) AVAILABLE AI MODELS           ")))
+    print(bold("==============================================================="))
+    print(f"  Account: {bold(active_alias)} ({cyan(email)}) [{bold(tier)} Tier]")
+    print(f"  Active:  {bold(green(current_model or 'Default'))}")
+    print(bold("---------------------------------------------------------------"))
+
+    active_match = match_model(current_model, parsed_models) if current_model else None
+    active_id = active_match["id"] if active_match else ""
+
+    for idx, m in enumerate(parsed_models, start=1):
+        is_active = (m["id"] == active_id) or (m["displayName"].lower() == current_model.lower())
+        marker = green("● ACTIVE  ") if is_active else dim("○         ")
+
+        rem = m.get("remainingFraction")
+        if rem is not None:
+            pct = int(rem * 100)
+            if pct > 40:
+                quota_str = green(f"{pct}% quota")
+            elif pct > 10:
+                quota_str = yellow(f"{pct}% quota")
+            else:
+                quota_str = red(f"{pct}% quota")
+        else:
+            quota_str = dim("Unlimited")
+
+        prov_str = cyan(m["provider"].ljust(9))
+        id_hint = dim(f"({m['id']})")
+        print(f" [{idx:2}] {marker} {bold(m['displayName'].ljust(26))} {prov_str} {quota_str}  {id_hint}")
+
+    print(bold("---------------------------------------------------------------"))
+    print(dim("Tip: Switch model using: ") + bold(cyan("agy model <number|name>")))
+    print(dim("Example: agy model opus  |  agy model 1  |  agy model sonnet"))
+    print()
+
+    if sys.stdin.isatty():
+        try:
+            choice = input(bold("Enter model number or name to switch (or press Enter to keep current): ")).strip()
+            if choice:
+                return manage_models(choice)
+        except (KeyboardInterrupt, EOFError):
+            print()
+    return True
+
 # --- Vault Storage ---
 def init_vault():
     """Initializes the vault and registers active account if present."""
@@ -382,8 +820,17 @@ def list_accounts():
         marker = green("● ACTIVE  ") if is_active else dim("○         ")
         prefix = f" [{idx}] {marker} {bold(alias.ljust(12))} "
         print(f"{prefix} {cyan(email.ljust(28))} {status_str}")
+        tier = info.get("plan_tier", "")
+        pref_model = info.get("preferred_model", "")
+        extra_parts = []
         if name:
-            print(f"       {dim('└─ ' + name)}")
+            extra_parts.append(name)
+        if tier:
+            extra_parts.append(f"{tier} Plan")
+        if pref_model:
+            extra_parts.append(f"Model: {pref_model}")
+        if extra_parts:
+            print(f"       {dim('└─ ' + ' | '.join(extra_parts))}")
 
     print(bold("---------------------------------------------------------------"))
     print()
@@ -465,7 +912,11 @@ def switch_account(identifier):
     print(dim("ℹ All your sessions, conversations, and projects remain active & preserved."))
 
     # Immediate quota & verification check
-    check_and_handle_verification(target_alias, tdata, interactive=True)
+    verif_ok = check_and_handle_verification(target_alias, tdata, interactive=True)
+
+    # Sync AI models on demand for ONLY this account
+    if verif_ok is not False:
+        sync_account_models_on_switch(target_alias, tdata.get("token", {}).get("access_token"))
 
     running = check_running_agy()
     if running:
@@ -760,6 +1211,10 @@ def show_whoami():
         print(f"  Account Name:  {meta.get('name')}")
     print(f"  Token Health:  {status_str}")
     print(f"  Sessions:      {green('Active & Preserved')}")
+    tier = meta.get("plan_tier", "Unknown")
+    current_model = get_active_cli_model()
+    print(f"  Plan Tier:     {bold(tier)}")
+    print(f"  Active Model:  {bold(green(current_model or 'Default'))}")
     if os.path.exists(profile_token):
         try:
             check_and_handle_verification(active, tdata, interactive=False)
@@ -1025,8 +1480,13 @@ def force_refresh(alias=None):
 def interactive_menu():
     while True:
         keys = list_accounts()
+        current_model = get_active_cli_model()
+        if current_model:
+            print(dim("  Active AI Model: ") + bold(green(current_model)))
+            print(bold("---------------------------------------------------------------"))
         print(bold("Actions:"))
         print(f"  [{bold('1-' + str(len(keys)) if keys else 'None')}] Switch to account")
+        print(f"  [{bold('m')}] Switch AI model (Claude Opus, Sonnet, Gemini, GPT)")
         print(f"  [{bold('v')}] View live quota & verification status")
         print(f"  [{bold('a')}] Add new account (Login via Google OAuth)")
         print(f"  [{bold('r')}] Force refresh token")
@@ -1054,6 +1514,10 @@ def interactive_menu():
             else:
                 print(red("Invalid account number."))
                 time.sleep(1)
+        elif choice in ("m", "model", "models"):
+            manage_models()
+            try: input("\nPress Enter to continue...")
+            except Exception: pass
         elif choice in ("v", "quota", "usage", "verify"):
             show_quota()
             try: input("\nPress Enter to continue...")
@@ -1102,6 +1566,10 @@ def main():
     sw_parser = subparsers.add_parser("switch", aliases=["use", "s"], help="Switch to an account")
     sw_parser.add_argument("account", help="Account alias, index, or email")
 
+    model_parser = subparsers.add_parser("model", aliases=["models", "m"], help="View or switch AI model (Claude Opus, Sonnet, Gemini, GPT)")
+    model_parser.add_argument("target", nargs="?", default=None, help="Model number, name, or alias (e.g. 'opus', 'sonnet', 'gemini', '1')")
+    model_parser.add_argument("-r", "--refresh", action="store_true", help="Force refresh models list from Google API")
+
     ck_parser = subparsers.add_parser("check", aliases=["quota", "usage", "verify"], help="Check live quota and account verification status")
     ck_parser.add_argument("alias", nargs="?", default=None, help="Account alias (defaults to active)")
 
@@ -1138,6 +1606,8 @@ def main():
         list_accounts()
     elif args.command in ("switch", "use", "s"):
         switch_account(args.account)
+    elif args.command in ("model", "models", "m"):
+        manage_models(args.target, refresh=args.refresh)
     elif args.command in ("check", "quota", "usage", "verify"):
         show_quota(args.alias)
     elif args.command in ("add", "login", "new"):

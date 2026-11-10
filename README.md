@@ -23,11 +23,13 @@
 
 - 🔄 **Instant Account Switching**: Swap active accounts with `agy switch <alias>` or `agy switch <number>` in under 0.1s.
 - 💾 **100% Session & History Preservation**: Conversations in `agy` are stored in local SQLite databases independent of user credentials. Switching accounts lets you resume the exact same conversation (`agy -c`) using your other account's Pro quota.
+- 🤖 **On-Demand AI Model Synchronization**: Synchronizes available models dynamically when you switch to an account. Automatically unlocks and selects your Pro model (Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS) when switching to Pro accounts, and gracefully falls back to supported Gemini models on Standard accounts.
+- 🎯 **Direct Model Switcher (`agy model`)**: Inspect available models, remaining quotas, and switch active AI models in 1 second (`agy model opus`, `agy model sonnet`, `agy model 1`).
 - 🔒 **Permanent Logins**: Never re-authenticate through a browser again. Each account's OAuth `refresh_token` is safely preserved in an isolated local vault.
 - 📱 **Mobile & Termux Optimized**: Includes an interactive visual menu (`agy switch`) so you can tap numbers instead of typing names on mobile keyboards.
 - ⚡ **Auto-Token Refresh**: Automatically refreshes short-lived Google access tokens in the background before activating them.
 - 🌍 **Cross-Platform**: Zero third-party dependencies (pure Python 3 standard library). Runs identically on Android Termux, Linux, macOS, and Windows.
-- 🧩 **Native Shell Integration**: Directly extends the official `agy` command (`agy accounts`, `agy switch`).
+- 🧩 **Native Shell Integration**: Directly extends the official `agy` command (`agy accounts`, `agy switch`, `agy model`).
 
 ---
 
@@ -126,6 +128,28 @@ agy-switch add pro4
 agy-switch whoami
 ```
 
+### 6. Manage & Switch AI Models (On-Demand)
+
+`agy-switch` queries Google's model backend on-demand when you switch to an account, dynamically tailoring `settings.json` to that account's entitled tier (Pro vs Standard):
+
+- **Automatic Tier Adaptation**: Switching to a Pro account immediately unlocks and restores Pro models (Gemini 4 Argon, Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS). Switching to a Standard/Plus account gracefully falls back to Gemini 2.5 Pro without errors or stale configurations.
+- **View & Switch Models**:
+
+```bash
+# View available models & quota for the active account
+agy model
+
+# Switch model directly by name or alias
+agy model argon
+agy model opus
+agy model sonnet
+agy model gpt
+agy model gemini-pro
+
+# Switch by index number
+agy model 1
+```
+
 ---
 
 ## 📋 Full Command Reference
@@ -134,11 +158,13 @@ agy-switch whoami
 | :--- | :--- | :--- |
 | `agy accounts` | `agy-switch list` | Display all accounts with token health & active indicator |
 | `agy switch` | `agy-switch` | Launch the interactive selection menu |
-| `agy switch <target>` | `agy-switch switch <target>` | Switch active account by alias, number, or email |
+| `agy switch <target>` | `agy-switch switch <target>` | Switch active account (fetches models & auto-adapts tier) |
+| `agy model` | `agy-switch model` | List all available AI models with live quotas & active indicator |
+| `agy model <name\|idx>` | `agy-switch model <target>` | Switch active model (`opus`, `sonnet`, `gemini-pro`, `1`) |
 | `agy-switch add [alias]` | `agy-switch login` | Add and authenticate a new Google account |
 | `agy quota [alias]` | `agy usage`, `agy verify` | Live rate limits (Gemini, Claude, GPT) & instant verification link |
 | `agy refresh [alias]` | `agy-switch refresh` | Proactively refresh an account's token with Google |
-| `agy-switch whoami` | `agy-switch status` | Inspect the currently active account |
+| `agy-switch whoami` | `agy-switch status` | Inspect active account, plan tier, and active model |
 | `agy-switch remove <alias>` | `agy-switch rm` | Delete an account from the vault |
 | `agy-switch rename <old> <new>` | — | Rename an account alias |
 | `agy-switch import <file> [alias]` | — | Import an existing `antigravity-oauth-token` JSON file |

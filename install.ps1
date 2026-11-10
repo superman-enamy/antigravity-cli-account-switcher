@@ -68,6 +68,8 @@ function agy {
         python "$destFile" check `$args[1..`$args.Count]
     } elseif (`$args.Count -gt 0 -and `$args[0] -eq 'refresh') {
         python "$destFile" refresh `$args[1..`$args.Count]
+    } elseif (`$args.Count -gt 0 -and (`$args[0] -eq 'model' -or `$args[0] -eq 'models')) {
+        python "$destFile" model `$args[1..`$args.Count]
     } else {
         & (Get-Command agy.exe -CommandType Application).Source @args
     }

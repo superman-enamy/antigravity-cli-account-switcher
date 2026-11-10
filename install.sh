@@ -102,6 +102,9 @@ agy() {
     elif [ "$1" = "refresh" ]; then
         shift
         agy-switch refresh "$@"
+    elif [ "$1" = "model" ] || [ "$1" = "models" ]; then
+        shift
+        agy-switch model "$@"
     else
         \command agy "$@"
     fi
@@ -135,6 +138,9 @@ elif [ "$1" = "quota" ] || [ "$1" = "usage" ] || [ "$1" = "verify" ] || [ "$1" =
 elif [ "$1" = "refresh" ]; then
     shift
     exec /data/data/com.termux/files/usr/bin/agy-switch refresh "$@"
+elif [ "$1" = "model" ] || [ "$1" = "models" ]; then
+    shift
+    exec /data/data/com.termux/files/usr/bin/agy-switch model "$@"
 else
     exec /data/data/com.termux/files/usr/bin/agy-real "$@"
 fi
@@ -176,7 +182,9 @@ echo -e "${BOLD}Quick Usage:${NC}"
 echo -e "  ${CYAN}agy accounts${NC}             List all registered Google Pro accounts"
 echo -e "  ${CYAN}agy switch${NC}               Interactive account picker menu"
 echo -e "  ${CYAN}agy switch pro2${NC}          Switch to account 'pro2' instantly"
+echo -e "  ${CYAN}agy model${NC}                List available AI models & select active model"
+echo -e "  ${CYAN}agy model opus${NC}           Switch directly to Claude Opus 5.5"
 echo -e "  ${CYAN}agy-switch add <alias>${NC}   Log in & register another Google Pro account"
-echo -e "  ${CYAN}agy-switch whoami${NC}        Show active account and token expiry"
+echo -e "  ${CYAN}agy-switch whoami${NC}        Show active account, tier, and model"
 echo
 echo -e "${YELLOW}Note: Restart your terminal or run 'source ~/.bashrc' (or ~/.zshrc) to activate commands.${NC}\n"
