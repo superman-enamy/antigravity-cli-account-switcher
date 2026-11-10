@@ -23,8 +23,8 @@
 
 - 🔄 **Instant Account Switching**: Swap active accounts with `agy switch <alias>` or `agy switch <number>` in under 0.1s.
 - 💾 **100% Session & History Preservation**: Conversations in `agy` are stored in local SQLite databases independent of user credentials. Switching accounts lets you resume the exact same conversation (`agy -c`) using your other account's Pro quota.
-- 🤖 **On-Demand AI Model Synchronization**: Synchronizes available models dynamically when you switch to an account. Automatically unlocks and selects your Pro model (Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS) when switching to Pro accounts, and gracefully falls back to supported Gemini models on Standard accounts.
-- 🎯 **Direct Model Switcher (`agy model`)**: Inspect available models, remaining quotas, and switch active AI models in 1 second (`agy model opus`, `agy model sonnet`, `agy model 1`).
+- 🤖 **On-Demand AI Model Synchronization**: Synchronizes available models dynamically when you switch to an account. Automatically unlocks and selects your Pro model (Gemini 4 Argon, Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS) when switching to Pro accounts, and gracefully falls back to supported Gemini models on Standard accounts.
+- 🎯 **Direct Model Switcher (`agy model`)**: Inspect available models, remaining quotas, and switch active AI models in 1 second (`agy model argon`, `agy model opus`, `agy model sonnet`, `agy model 1`).
 - 🔒 **Permanent Logins**: Never re-authenticate through a browser again. Each account's OAuth `refresh_token` is safely preserved in an isolated local vault.
 - 📱 **Mobile & Termux Optimized**: Includes an interactive visual menu (`agy switch`) so you can tap numbers instead of typing names on mobile keyboards.
 - ⚡ **Auto-Token Refresh**: Automatically refreshes short-lived Google access tokens in the background before activating them.
@@ -160,7 +160,7 @@ agy model 1
 | `agy switch` | `agy-switch` | Launch the interactive selection menu |
 | `agy switch <target>` | `agy-switch switch <target>` | Switch active account (fetches models & auto-adapts tier) |
 | `agy model` | `agy-switch model` | List all available AI models with live quotas & active indicator |
-| `agy model <name\|idx>` | `agy-switch model <target>` | Switch active model (`opus`, `sonnet`, `gemini-pro`, `1`) |
+| `agy model <name\|idx>` | `agy-switch model <target>` | Switch active model (`argon`, `opus`, `sonnet`, `gemini-pro`, `1`) |
 | `agy-switch add [alias]` | `agy-switch login` | Add and authenticate a new Google account |
 | `agy quota [alias]` | `agy usage`, `agy verify` | Live rate limits (Gemini, Claude, GPT) & instant verification link |
 | `agy refresh [alias]` | `agy-switch refresh` | Proactively refresh an account's token with Google |
@@ -213,6 +213,23 @@ Eligibility Check
   1. In your active CLI session, type `/exit` (or press `Ctrl+D`).
   2. Switch account: `agy switch <alias>`
   3. Resume your exact conversation: `agy -c` (all context, tools, and history are preserved).
+
+---
+
+### 3. 📱 Termux Native Binary & Gemini 4 Argon Support (`v1.5.4+`)
+If you are on Android Termux and previously installed an older unofficial `glibc`-wrapped `agy` binary (such as `v1.1.27` / `agy.va39`), newer models like **Gemini 4 Argon (`gemini-4-argon-high`)** will be rejected by the old binary's local model resolver and outdated User-Agent version gate.
+
+Google now provides an **official native Android ARM64 (Bionic)** build (`v1.5.4+`) that runs directly on Termux without any `glibc` wrapper and includes built-in `agy update` and **Gemini 4 Argon** support:
+
+```bash
+# Check your current underlying binary version
+agy-real --version
+
+# Update to the latest official Google Android ARM64 release anytime
+agy update
+```
+
+*(If migrating from an older unofficial `glibc` package on Termux, extract Google's `android_arm64` archive from `https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/android_arm64.json` directly into `$PREFIX/bin/agy-real` and `chmod +x $PREFIX/bin/agy-real`).*
 
 ---
 

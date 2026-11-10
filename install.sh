@@ -183,6 +183,7 @@ echo -e "  ${CYAN}agy accounts${NC}             List all registered Google Pro a
 echo -e "  ${CYAN}agy switch${NC}               Interactive account picker menu"
 echo -e "  ${CYAN}agy switch pro2${NC}          Switch to account 'pro2' instantly"
 echo -e "  ${CYAN}agy model${NC}                List available AI models & select active model"
+echo -e "  ${CYAN}agy model argon${NC}          Switch directly to Gemini 4 Argon (High)"
 echo -e "  ${CYAN}agy model opus${NC}           Switch directly to Claude Opus 5.5"
 echo -e "  ${CYAN}agy-switch add <alias>${NC}   Log in & register another Google Pro account"
 echo -e "  ${CYAN}agy-switch whoami${NC}        Show active account, tier, and model"
